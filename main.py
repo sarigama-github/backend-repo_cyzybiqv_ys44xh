@@ -1,9 +1,13 @@
-import os
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, EmailStr
+from typing import Optional
+from database import create_document, db
+import os
 
-app = FastAPI()
+app = FastAPI(title="Mykonos Made in Italy API", version="1.0.0")
 
+# CORS - allow frontend preview and general use
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,60 +16,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
+class WaitlistIn(BaseModel):
+    email: EmailStr
+    source: Optional[str] = None
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
 
 @app.get("/test")
-def test_database():
-    """Test endpoint to check if database is available and accessible"""
-    response = {
-        "backend": "✅ Running",
-        "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
-        "connection_status": "Not Connected",
-        "collections": []
-    }
-    
+async def test_db():
+    has_db = db is not None
+    name = os.getenv("DATABASE_NAME") if has_db else None
+    return {"database_connected": has_db, "database_name": name}
+
+
+@app.post("/waitlist")
+async def join_waitlist(payload: WaitlistIn, request: Request):
     try:
-        # Try to import database module
-        from database import db
-        
-        if db is not None:
-            response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
-            response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
-            try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
-                response["database"] = "✅ Connected & Working"
-            except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
-        else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+        # Basic dedupe check: do not insert duplicates (best-effort)
+        # Using find_one requires a direct call; keep this lightweight
+        if db is None:
+            raise HTTPException(status_code=500, detail="Database not available")
+
+        existing = db["waitlist"].find_one({"email": payload.email.lower()})
+        if existing:
+            return {"ok": True, "message": "You are already on the waitlist."}
+
+        meta = {
+            "email": payload.email.lower(),
+            "source": payload.source,
+            "ip": request.client.host if request and request.client else None,
+            "user_agent": request.headers.get("user-agent"),
+        }
+        _id = create_document("waitlist", meta)
+        return {"ok": True, "id": _id}
+    except HTTPException:
+        raise
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
-    return response
-
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+        raise HTTPException(status_code=500, detail=str(e))
